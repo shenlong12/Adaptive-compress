@@ -534,6 +534,9 @@ experiments/**/*.pt
 experiments/**/*.safetensors
 wandb/
 .wandb/
+# 保留 experiments 文件夹，但忽略里面的切片模型目录
+sliced_llama3_*/
+sliced_opt_*/
 
-# 如果你整个 experiments 文件夹都不想上传，可以直接写：
-# experiments/
+# (可选) 如果你以后还有其他模型，可以直接写个更通用的：
+# sliced_*/
