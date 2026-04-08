@@ -33,9 +33,9 @@ class LightweightRouter:
         # 加载你训练好的路由大脑权重
         if torch.cuda.is_available() and model_path and os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=device))
-            print("🧠 成功加载自适应轻量级识别接口！")
+            print("成功加载自适应轻量级识别接口！")
         else:
-            print("⚠️ 尚未找到训练好的权重，当前接口为空白状态。")
+            print("尚未找到训练好的权重，当前接口为空白状态。")
 
         self.model.eval()
 
