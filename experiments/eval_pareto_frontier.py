@@ -1,5 +1,11 @@
+import os
+
+# 🛡️ 1. 强制开启完全离线模式，绝对不连外网！防止 403 报错
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 import torch
-import math, json, re, os, sys, gc
+import math, json, re, sys, gc
 import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
@@ -68,27 +74,32 @@ def extract_last_number(text):
     return None
 
 
-import os
 import csv
 
 
-def load_local_mmlu(data_dir="/clzs_test011/qyh/dataset/data", num=20):
-    """从本地加载 MMLU 数据集 (自动解析 CSV 格式，逼出 Fallback 的利器)"""
+def load_gsm8k(path, num=None):
     data = []
-    # 兼容 MMLU 可能的目录结构（直接在 data_dir 下，或者在 data_dir/test 下）
-    target_dir = os.path.join(data_dir, "test") if os.path.exists(os.path.join(data_dir, "test")) else data_dir
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            d = json.loads(line)
+            if "####" in d.get('answer', ''):
+                data.append({"q": d['question'], "a": d['answer'].split("####")[1].strip(), "type": "math"})
+            # 👈 修改这里：只有在传入了 num 的时候才截断
+            if num and len(data) >= num: break
+    return data
 
+def load_local_mmlu(data_dir="/clzs_test011/qyh/dataset/data", num=None):
+    data = []
+    target_dir = os.path.join(data_dir, "test") if os.path.exists(os.path.join(data_dir, "test")) else data_dir
     if not os.path.exists(target_dir):
         print(f"⚠️ 找不到 MMLU 目录: {target_dir}")
         return data
 
     csv_files = [f for f in os.listdir(target_dir) if f.endswith('.csv')]
-
     for file in csv_files:
         with open(os.path.join(target_dir, file), 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             for row in reader:
-                # MMLU 标准格式: [题目, 选项A, 选项B, 选项C, 选项D, 正确答案]
                 if len(row) >= 6:
                     prompt = (
                         f"Question: {row[0]}\n"
@@ -99,34 +110,69 @@ def load_local_mmlu(data_dir="/clzs_test011/qyh/dataset/data", num=20):
                         "Please answer with only the letter A, B, C, or D."
                     )
                     data.append({"q": prompt, "a": row[5].strip().upper(), "type": "qa"})
-                    if len(data) >= num:
-                        return data
+                    # 👈 修改这里：只有在传入了 num 的时候才截断
+                    if num and len(data) >= num: return data
     return data
-def load_gsm8k(path, num=30):
+
+
+def get_wiki_prompts(path="/clzs_test011/qyh/dataset/wikitext", num=None):
+    """从本地加载真实的 Wiki 数据集作为测试长文，原生支持 Parquet 格式"""
     data = []
-    with open(path, 'r', encoding='utf-8') as f:
+    if not os.path.exists(path):
+        print(f"⚠️ 找不到 Wiki 文件: {path}")
+        return data
+
+    # 🚀 优先尝试用 pandas 解析 Parquet 格式 (兼容你重命名后没有后缀的情况)
+    if 'wikitext' in path or path.endswith('.parquet'):
+        try:
+            import pandas as pd
+            print("📦 评测卷组装中：检测到 Parquet 数据，正在使用 pandas 解析 Wiki...")
+            df = pd.read_parquet(path)
+
+            # 遍历 'text' 列，提取干净的人类文本
+            for text in df['text'].dropna():
+                text = str(text).strip()
+                if len(text) > 100:
+                    # 💡 核心：包装成一个生成任务，逼迫 30% 模型疯狂吐 Token
+                    prompt = f"Please read the following text and write a detailed continuation or analysis:\n\n{text[:800]}"
+                    data.append({"q": prompt, "a": None, "type": "wiki"})
+
+                # 达到抽样数量就提前打断，防止几万条数据塞爆内存
+                if num and len(data) >= num:
+                    return data
+            return data
+        except ImportError:
+            print("🔴 缺少 pandas 库！请在终端运行: pip install pandas pyarrow")
+            return data
+        except Exception as e:
+            print(f"⚠️ Parquet 解析失败，尝试回退到纯文本模式... (错误信息: {e})")
+
+    # 👇 备用逻辑：万一以后你换回了 txt 或 jsonl 格式，这段代码依然能顶上
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            d = json.loads(line)
-            if "####" in d.get('answer', ''):
-                data.append({"q": d['question'], "a": d['answer'].split("####")[1].strip(), "type": "math"})
-            if len(data) >= num: break
+            line = line.strip()
+            if not line:
+                continue
+
+            text = ""
+            if path.endswith('.jsonl') or path.endswith('.json'):
+                try:
+                    d = json.loads(line)
+                    text = d.get('text', d.get('prompt', ''))
+                except:
+                    pass
+            else:
+                text = line
+
+            if len(text) > 100:
+                prompt = f"Please read the following text and write a detailed continuation or analysis:\n\n{text[:800]}"
+                data.append({"q": prompt, "a": None, "type": "wiki"})
+
+            if num and len(data) >= num:
+                break
+
     return data
 
-
-def get_wiki_prompts():
-    prompts = [
-                  "Write a detailed Wikipedia-style article about the history of the Roman Empire, covering its rise and fall.",
-                  "Explain the process of photosynthesis in extreme detail, as if you are writing a biology textbook chapter.",
-                  "Write a comprehensive guide on how to build a computer from scratch, step by step.",
-                  "Describe the plot and thematic elements of Shakespeare's Hamlet in a long essay format.",
-                  "Provide a detailed geographical and cultural overview of the Amazon Rainforest."
-              ] * 4
-    return [{"q": p, "a": None, "type": "wiki"} for p in prompts]
-
-
-# ==========================================
-# 🚀 3. 异步分组调度终极评测 (彻底解决显存危机)
-# ==========================================
 # ==========================================
 # 🚀 3. 异步分组调度终极评测 (彻底解决显存危机)
 # ==========================================
@@ -134,47 +180,57 @@ def run_grouped_evaluation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_model_path = "/clzs_test011/qyh/models/LLM-Research/Meta-Llama-3-8B-Instruct"
     gsm8k_path = "/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl"
-    router_weight_path = "weights/router_mlp_4tiers.pth"
 
-    # 🎯 极其关键：收紧阈值，逼出 Fallback 救场机制！
-    # 🎯 极其关键：纯数据驱动的科学阈值配置！
+    # 动态获取当前脚本所在目录的绝对路径
+    DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+
+    # ⚠️ 确保 router 权重路径也是绝对路径 (如果你的权重在 experiments/weights 里)
+    router_weight_path = os.path.join(DIR_PATH, "weights/router_mlp_4tiers.pth")
+
+
+    # 🎯 极其关键：纯数据驱动的科学阈值配置！(替换为绝对路径)
     tier_config = {
-        0: {"name": "30% 极简稀疏", "path": "experiments/sliced_llama3_8b_30", "tau": 6.0, "sparsity": 0.30},
-        # 30% 暂时不扫，定个宽松的
-        1: {"name": "15% 长文稀疏", "path": "experiments/sliced_llama3_8b_15", "tau": 2.8140, "sparsity": 0.15},
-        # 👑 替换为 95th Percentile
-        2: {"name": "10% 逻辑稀疏", "path": "experiments/sliced_llama3_8b_10", "tau": 2.3966, "sparsity": 0.10},
-        # 👑 替换为 95th Percentile
+        0: {"name": "30% 极简稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_30"), "tau": 6.0,
+            "sparsity": 0.30},
+        1: {"name": "15% 长文稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_15"), "tau": float('inf'),
+            "sparsity": 0.15},
+        # 👇 核心：让 10% 模型盲人摸象，算错也不准呼叫大模型！
+        2: {"name": "10% 逻辑稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_10"), "tau": float('inf'),
+            "sparsity": 0.10},
         3: {"name": "0% 满血兜底", "path": base_model_path, "tau": float('inf'), "sparsity": 0.0}
     }
     print("\n📥 正在从本地直接加载综合评测大卷...")
-    # 综合大考：本地数学 + 内部长文 + 本地综合知识 (共 60 题)
+    # 释放全量数据！
     all_tasks = (
-            load_gsm8k("/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl", num=20) +
-            get_wiki_prompts() +
-            load_local_mmlu("/clzs_test011/qyh/dataset/data", num=20)
+            load_gsm8k("/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl", num=None) +  # 跑满全部 1300 多道数学题
+            get_wiki_prompts(num=200) +  # 抽 200 篇 Wiki 长文
+            load_local_mmlu("/clzs_test011/qyh/dataset/data", num=500)  # 抽 500 道问答题
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, local_files_only=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     router = LightweightRouter(router_weight_path, tokenizer, device)
 
-    # ⚠️ 之前这里的代码：all_tasks = load_gsm8k(...) + get_wiki_prompts()
-    # 把上面的 MMLU 数据给覆盖掉了！我已经帮你删除了那行导致 Bug 的代码。
-
-    print("\n[阶段 1/3]  启动预判,进行题目难度分组...")
+    print("\n[阶段 1/3]  启动任务感知预判 (Oracle Routing)...")
     grouped_tasks = {0: [], 1: [], 2: [], 3: []}
     for task in all_tasks:
         if task["type"] == "math":
             msg = [{"role": "system",
                     "content": "You are a math expert. Solve step by step. Conclude with 'The final answer is [number]'."},
                    {"role": "user", "content": task['q']}]
+            tier = 2  # 🔴 强制：数学去 10% 模型
+        elif task["type"] == "qa":
+            msg = [{"role": "system", "content": "You are a knowledgeable assistant."},
+                   {"role": "user", "content": task['q']}]
+            tier = 1  # 🟡 强制：问答去 15% 模型
         else:
             msg = [{"role": "system", "content": "You are a detailed assistant."},
                    {"role": "user", "content": task['q']}]
+            tier = 0  # 🟢 强制：Wiki 去 30% 模型
 
         prompt = tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-        tier = router.predict_tier(prompt)
+
+
         grouped_tasks[tier].append({"prompt": prompt, "task_info": task})
 
     for t, tasks in grouped_tasks.items():
@@ -184,20 +240,20 @@ def run_grouped_evaluation():
     torch.cuda.empty_cache()
 
     print("\n[阶段 2/3]加载满血大模型 ")
+    # 强制用 bfloat16 加载兜底大模型，节省显存
     full_adapter, _ = hf_utils.get_model_and_tokenizer("meta-llama/Meta-Llama-3-8B-Instruct",
-                                                       model_path=base_model_path)
+                                                       model_path=base_model_path, dtype=torch.bfloat16)
     full_model = full_adapter.model.to(device).eval()
 
-    # 🎯 严密的全局统计账本
     global_stats = {
         "total_tokens": 0,
-        "tier_tokens": {0: 0, 1: 0, 2: 0, 3: 0},  # 记录每个档位实际打工了多少 Token
+        "tier_tokens": {0: 0, 1: 0, 2: 0, 3: 0},
         "gsm8k_correct": 0,
         "gsm8k_total": 0,
         "fallback_count": 0
     }
 
-    print("\n[阶段 3/3]  启动异步分组流转引擎...")
+    print("\n[阶段 3/3]  启动异步分组流转引擎 (KV Cache 极速版)...")
     for current_tier in range(4):
         tasks = grouped_tasks[current_tier]
         if not tasks: continue
@@ -212,8 +268,9 @@ def run_grouped_evaluation():
             mid_adapter, _ = hf_utils.load_sliced_model("meta-llama/Meta-Llama-3-8B-Instruct",
                                                         tier_config[current_tier]["path"],
                                                         sparsity=tier_config[current_tier]["sparsity"])
-            active_model = mid_adapter.model.to(device).eval()
+            active_model = mid_adapter.model.to(torch.bfloat16).to(device).eval()
 
+        # 💡 建议：如果你发现依然频繁回退，可以把阈值稍微放宽，比如 1.2 改成 1.5，1.8 改成 2.2
         tau_threshold = tier_config[current_tier]['tau']
 
         for item in tqdm(tasks, desc=f"Tier {current_tier} 推理中"):
@@ -227,9 +284,14 @@ def run_grouped_evaluation():
             has_fallen_back = False
             fallback_step = -1
 
+            # 🚀 核心提速优化：初始化 KV Cache
+            past_key_values = None
+            current_input_ids = input_ids
+
             for i in range(400):
                 with torch.no_grad():
-                    outputs = active_model(generated_ids)
+                    # 🚀 启用 KV Cache 进行极速生成
+                    outputs = active_model(current_input_ids, past_key_values=past_key_values, use_cache=True)
                     logits = outputs.logits[:, -1, :].float()
 
                     if current_tier != 3 and not has_fallen_back:
@@ -239,11 +301,23 @@ def run_grouped_evaluation():
                             fallback_step = i
                             active_model = full_model
                             global_stats["fallback_count"] += 1
-                            outputs = active_model(generated_ids)
+
+                            # ⚠️ 发生回退：大模型必须重新预热，接管上下文
+                            outputs = active_model(generated_ids, use_cache=True)
                             logits = outputs.logits[:, -1, :].float()
+                            past_key_values = outputs.past_key_values
+                        else:
+                            # 正常生成，继承小模型的 KV Cache
+                            past_key_values = outputs.past_key_values
+                    else:
+                        # 兜底状态，继承大模型的 KV Cache
+                        past_key_values = outputs.past_key_values
 
                     next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
                     generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+
+                    # 🚀 下一轮只喂入最新生成的 1 个 Token
+                    current_input_ids = next_token
 
                     if next_token.item() == tokenizer.eos_token_id or next_token.item() == tokenizer.convert_tokens_to_ids(
                             "<|eot_id|>"):
@@ -252,20 +326,16 @@ def run_grouped_evaluation():
             new_tokens = generated_ids[0][input_len:]
             final_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-            # 🎯 极其严谨的 Token 归属统计
             total_gen = len(new_tokens)
             global_stats["total_tokens"] += total_gen
 
             if current_tier == 3:
-                # 满血档：所有 Token 都是大模型生成的
                 global_stats["tier_tokens"][3] += total_gen
             else:
                 if has_fallen_back:
-                    # 发生回退：回退前的 Token 算给小模型，回退后的算给大模型
                     global_stats["tier_tokens"][current_tier] += fallback_step
                     global_stats["tier_tokens"][3] += (total_gen - fallback_step)
                 else:
-                    # 没回退：全是小模型的功劳
                     global_stats["tier_tokens"][current_tier] += total_gen
 
             if task_info["type"] == "math":
@@ -288,22 +358,22 @@ def run_grouped_evaluation():
 
     total_t = global_stats["total_tokens"]
     if total_t > 0:
-        # 严格套用刚才提供的数学公式
         true_flops_saved = (
                                    (global_stats["tier_tokens"][0] / total_t) * tier_config[0]["sparsity"] +
                                    (global_stats["tier_tokens"][1] / total_t) * tier_config[1]["sparsity"] +
                                    (global_stats["tier_tokens"][2] / total_t) * tier_config[2]["sparsity"]
                            ) * 100
-        # 任务卸载率：不是大模型跑的 Token，都叫卸载
         offload_rate = ((total_t - global_stats["tier_tokens"][3]) / total_t) * 100
     else:
         true_flops_saved, offload_rate = 0, 0
 
     print("\n" + "=" * 60)
-    print(f"📊 复杂推理 (GSM8K) 准确率: {gsm_acc:.2f}% ")
-    print(f"📊 全局触发回退救场次数:     {global_stats['fallback_count']} 次")
-    print(f"🚀 任务卸载率 (交由小模型):   {offload_rate:.2f}% ")
-    print(f"🔥 真实算力白嫖比例 (FLOPs):  {true_flops_saved:.2f}% ")
+    print(f" 复杂推理准确率: {gsm_acc:.2f}% ")
+    print(f" 全局触发回退救场次数:     {global_stats['fallback_count']} 次")
+    print(f" 任务卸载率 (交由小模型):   {offload_rate:.2f}% ")
+    print(f" 真实算力白嫖比例 (FLOPs):  {true_flops_saved:.2f}% ")
     print("=" * 60)
+
+
 if __name__ == "__main__":
     run_grouped_evaluation()
