@@ -521,3 +521,19 @@ Control.ca-list
 Control.ca-bundle 
 Control.system-ca-bundle 
 GitHub.sublime-settings 
+# ---------- 新增：忽略大模型和日志 ----------
+# 忽略权重文件
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# 忽略本地的大型实验数据和日志
+experiments/**/*.pt
+experiments/**/*.safetensors
+wandb/
+.wandb/
+
+# 如果你整个 experiments 文件夹都不想上传，可以直接写：
+# experiments/
