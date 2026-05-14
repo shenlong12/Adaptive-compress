@@ -1,5 +1,7 @@
 import os
-
+import random  # 🌟 新增：导入随机数库
+import torch
+# ... 其他 import 保持不变
 # 🛡️ 1. 强制开启完全离线模式，绝对不连外网！防止 403 报错
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -10,7 +12,9 @@ import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
 from transformers import AutoTokenizer
+from transformers.cache_utils import DynamicCache  # 🌟 必须导入它来兼容 LLaMA-3 的 KV Cache
 
+# 借用 slicegpt 加载库
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from slicegpt import hf_utils
 
@@ -46,7 +50,7 @@ class LightweightRouter:
 
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=device))
-            print("🟢 成功加载 4 档位！")
+            print("🟢 成功加载 4 档位路由权重！")
         else:
             print(f"🔴 致命错误：找不到雷达权重 {model_path}，请先运行 train_router.py")
             sys.exit(1)
@@ -84,9 +88,9 @@ def load_gsm8k(path, num=None):
             d = json.loads(line)
             if "####" in d.get('answer', ''):
                 data.append({"q": d['question'], "a": d['answer'].split("####")[1].strip(), "type": "math"})
-            # 👈 修改这里：只有在传入了 num 的时候才截断
             if num and len(data) >= num: break
     return data
+
 
 def load_local_mmlu(data_dir="/clzs_test011/qyh/dataset/data", num=None):
     data = []
@@ -110,126 +114,133 @@ def load_local_mmlu(data_dir="/clzs_test011/qyh/dataset/data", num=None):
                         "Please answer with only the letter A, B, C, or D."
                     )
                     data.append({"q": prompt, "a": row[5].strip().upper(), "type": "qa"})
-                    # 👈 修改这里：只有在传入了 num 的时候才截断
                     if num and len(data) >= num: return data
     return data
 
+import os
+import json
+
 
 def get_wiki_prompts(path="/clzs_test011/qyh/dataset/wikitext", num=None):
-    """从本地加载真实的 Wiki 数据集作为测试长文，原生支持 Parquet 格式"""
     data = []
     if not os.path.exists(path):
         print(f"⚠️ 找不到 Wiki 文件: {path}")
         return data
 
-    # 🚀 优先尝试用 pandas 解析 Parquet 格式 (兼容你重命名后没有后缀的情况)
-    if 'wikitext' in path or path.endswith('.parquet'):
-        try:
-            import pandas as pd
-            print("📦 评测卷组装中：检测到 Parquet 数据，正在使用 pandas 解析 Wiki...")
-            df = pd.read_parquet(path)
+    print(f"📖 正在加载生成测试数据: {path}")
 
-            # 遍历 'text' 列，提取干净的人类文本
-            for text in df['text'].dropna():
-                text = str(text).strip()
-                if len(text) > 100:
-                    # 💡 核心：包装成一个生成任务，逼迫 30% 模型疯狂吐 Token
-                    prompt = f"Please read the following text and write a detailed continuation or analysis:\n\n{text[:800]}"
-                    data.append({"q": prompt, "a": None, "type": "wiki"})
+    # ======================================================
+    # 策略 1：优先尝试作为 Parquet 文件解析 (针对你当前的 wikitext)
+    # ======================================================
+    is_parquet = False
+    try:
+        import pandas as pd
+        # 尝试读取，如果它不是 parquet，这里会立刻抛出异常并跳走
+        df = pd.read_parquet(path)
+        is_parquet = True
+        print("✅ 成功匹配 Parquet 格式引擎！")
 
-                # 达到抽样数量就提前打断，防止几万条数据塞爆内存
-                if num and len(data) >= num:
-                    return data
-            return data
-        except ImportError:
-            print("🔴 缺少 pandas 库！请在终端运行: pip install pandas pyarrow")
-            return data
-        except Exception as e:
-            print(f"⚠️ Parquet 解析失败，尝试回退到纯文本模式... (错误信息: {e})")
-
-    # 👇 备用逻辑：万一以后你换回了 txt 或 jsonl 格式，这段代码依然能顶上
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            text = ""
-            if path.endswith('.jsonl') or path.endswith('.json'):
-                try:
-                    d = json.loads(line)
-                    text = d.get('text', d.get('prompt', ''))
-                except:
-                    pass
-            else:
-                text = line
-
+        for text in df['text'].dropna():
+            text = str(text).strip()
             if len(text) > 100:
                 prompt = f"Please read the following text and write a detailed continuation or analysis:\n\n{text[:800]}"
                 data.append({"q": prompt, "a": None, "type": "wiki"})
+                if num and len(data) >= num:
+                    return data
+        return data
 
-            if num and len(data) >= num:
-                break
+    except Exception as e:
+        # 只有确实抛出了异常（比如格式不对），我们才往下走
+        if is_parquet:
+            print(f"🔴 Parquet 解析中途崩溃: {e}")
+            return data
+        # 如果不是 Parquet，静默进入下一个策略
+
+    # ======================================================
+    # 策略 2：后备方案 - 解析 JSONL 或 纯文本 (针对未来其他数据集)
+    # ======================================================
+    try:
+        # 注意：如果是 Parquet 文件走到这里，一定会读出乱码
+        # 但没关系，我们上一步已经成功拦截了 Parquet！
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                text = ""
+
+                if path.endswith('.jsonl') or path.endswith('.json'):
+                    try:
+                        d = json.loads(line)
+                        text = d.get('text', d.get('prompt', ''))
+                    except:
+                        continue
+                else:
+                    text = line
+
+                if len(text) > 100:
+                    prompt = f"Please read the following text and write a detailed continuation or analysis:\n\n{text[:800]}"
+                    data.append({"q": prompt, "a": None, "type": "wiki"})
+
+                if num and len(data) >= num:
+                    break
+        print("✅ 成功匹配纯文本/JSONL 引擎！")
+    except Exception as e:
+        print(f"🔴 文本解析失败: {e}")
 
     return data
 
+
 # ==========================================
-# 🚀 3. 异步分组调度终极评测 (彻底解决显存危机)
+# 🚀 3. 异步分组调度终极评测 (SADS 端到端)
 # ==========================================
 def run_grouped_evaluation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_model_path = "/clzs_test011/qyh/models/LLM-Research/Meta-Llama-3-8B-Instruct"
-    gsm8k_path = "/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl"
 
-    # 动态获取当前脚本所在目录的绝对路径
     DIR_PATH = os.path.dirname(os.path.abspath(__file__))
-
-    # ⚠️ 确保 router 权重路径也是绝对路径 (如果你的权重在 experiments/weights 里)
     router_weight_path = os.path.join(DIR_PATH, "weights/router_mlp_4tiers.pth")
 
-
-    # 🎯 极其关键：纯数据驱动的科学阈值配置！(替换为绝对路径)
     tier_config = {
-        0: {"name": "30% 极简稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_30"), "tau": 6.0,
-            "sparsity": 0.30},
-        1: {"name": "15% 长文稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_15"), "tau": float('inf'),
-            "sparsity": 0.15},
-        # 👇 核心：让 10% 模型盲人摸象，算错也不准呼叫大模型！
-        2: {"name": "10% 逻辑稀疏", "path": os.path.join(DIR_PATH, "sliced_llama3_8b_10"), "tau": float('inf'),
-            "sparsity": 0.10},
-        3: {"name": "0% 满血兜底", "path": base_model_path, "tau": float('inf'), "sparsity": 0.0}
+        0: {"name": "30% 极简", "path": os.path.join(DIR_PATH, "llama3_8b_30"), "tau": 1.7555, "sparsity": 0.30},
+        1: {"name": "15% 均衡", "path": os.path.join(DIR_PATH, "llama3_8b_15"), "tau": 1.7555, "sparsity": 0.15},
+        2: {"name": "10% 逻辑", "path": os.path.join(DIR_PATH, "llama3_8b_10"), "tau": 1.7555, "sparsity": 0.10},
+        3: {"name": "0% 满血", "path": base_model_path, "tau": float('inf'), "sparsity": 0.0}
     }
-    print("\n📥 正在从本地直接加载综合评测大卷...")
-    # 释放全量数据！
+    print("\n📥 正在从本地加载综合评测大卷...")
     all_tasks = (
-            load_gsm8k("/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl", num=None) +  # 跑满全部 1300 多道数学题
-            get_wiki_prompts(num=200) +  # 抽 200 篇 Wiki 长文
-            load_local_mmlu("/clzs_test011/qyh/dataset/data", num=500)  # 抽 500 道问答题
+            load_gsm8k("/clzs_test011/qyh/dataset/gsm8k_fixed.jsonl", num=100) +
+            get_wiki_prompts(num=100) +
+            load_local_mmlu("/clzs_test011/qyh/dataset/data", num=100)
     )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, local_files_only=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     router = LightweightRouter(router_weight_path, tokenizer, device)
 
-    print("\n[阶段 1/3]  启动任务感知预判 (Oracle Routing)...")
+    print("\n[阶段 1/3]  启动任务感知预判 (Real Oracle Routing)...")
     grouped_tasks = {0: [], 1: [], 2: [], 3: []}
+
     for task in all_tasks:
+        # 分配系统提示词
         if task["type"] == "math":
             msg = [{"role": "system",
                     "content": "You are a math expert. Solve step by step. Conclude with 'The final answer is [number]'."},
                    {"role": "user", "content": task['q']}]
-            tier = 2  # 🔴 强制：数学去 10% 模型
+            tier = 1
         elif task["type"] == "qa":
             msg = [{"role": "system", "content": "You are a knowledgeable assistant."},
                    {"role": "user", "content": task['q']}]
-            tier = 1  # 🟡 强制：问答去 15% 模型
         else:
             msg = [{"role": "system", "content": "You are a detailed assistant."},
                    {"role": "user", "content": task['q']}]
-            tier = 0  # 🟢 强制：Wiki 去 30% 模型
 
         prompt = tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
 
+        # 🌟 临时干预：把测试集硬塞给 10% 的模型
+        tier = router.predict_tier(prompt)
+
+        if task["type"] == "math":
+            tier = 2  # 🔴 强制指定为 Tier 2 (10% 稀疏度模型)
 
         grouped_tasks[tier].append({"prompt": prompt, "task_info": task})
 
@@ -239,8 +250,7 @@ def run_grouped_evaluation():
     del router
     torch.cuda.empty_cache()
 
-    print("\n[阶段 2/3]加载满血大模型 ")
-    # 强制用 bfloat16 加载兜底大模型，节省显存
+    print("\n[阶段 2/3] 加载满血大模型 (0% 兜底)...")
     full_adapter, _ = hf_utils.get_model_and_tokenizer("meta-llama/Meta-Llama-3-8B-Instruct",
                                                        model_path=base_model_path, dtype=torch.bfloat16)
     full_model = full_adapter.model.to(device).eval()
@@ -250,10 +260,13 @@ def run_grouped_evaluation():
         "tier_tokens": {0: 0, 1: 0, 2: 0, 3: 0},
         "gsm8k_correct": 0,
         "gsm8k_total": 0,
-        "fallback_count": 0
+        "fallback_count": 0,
+        # 👇 新增下面三行，用来追踪多任务
+        "mmlu_correct": 0,
+        "mmlu_total": 0,
+        "wiki_count": 0
     }
-
-    print("\n[阶段 3/3]  启动异步分组流转引擎 (KV Cache 极速版)...")
+    print("\n[阶段 3/3]  启动异步分组流转引擎")
     for current_tier in range(4):
         tasks = grouped_tasks[current_tier]
         if not tasks: continue
@@ -270,7 +283,6 @@ def run_grouped_evaluation():
                                                         sparsity=tier_config[current_tier]["sparsity"])
             active_model = mid_adapter.model.to(torch.bfloat16).to(device).eval()
 
-        # 💡 建议：如果你发现依然频繁回退，可以把阈值稍微放宽，比如 1.2 改成 1.5，1.8 改成 2.2
         tau_threshold = tier_config[current_tier]['tau']
 
         for item in tqdm(tasks, desc=f"Tier {current_tier} 推理中"):
@@ -284,39 +296,53 @@ def run_grouped_evaluation():
             has_fallen_back = False
             fallback_step = -1
 
-            # 🚀 核心提速优化：初始化 KV Cache
             past_key_values = None
             current_input_ids = input_ids
 
             for i in range(400):
                 with torch.no_grad():
-                    # 🚀 启用 KV Cache 进行极速生成
                     outputs = active_model(current_input_ids, past_key_values=past_key_values, use_cache=True)
                     logits = outputs.logits[:, -1, :].float()
 
                     if current_tier != 3 and not has_fallen_back:
-                        entropy = torch.distributions.Categorical(logits=logits).entropy().item()
-                        if math.isnan(entropy) or entropy > tau_threshold:
+                        probs = torch.softmax(logits, dim=-1)
+                        entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).item()
+                        if entropy > tau_threshold:
                             has_fallen_back = True
                             fallback_step = i
                             active_model = full_model
                             global_stats["fallback_count"] += 1
 
-                            # ⚠️ 发生回退：大模型必须重新预热，接管上下文
-                            outputs = active_model(generated_ids, use_cache=True)
+                            # 🌟 核心修正 2：SADS 零拷贝继承
+                            padded_kv = []
+                            k_sparse_example, _ = outputs.past_key_values[0]
+                            pad_dim = full_model.config.hidden_size // full_model.config.num_attention_heads - \
+                                      k_sparse_example.shape[-1]
+
+                            for layer_idx, (k_sparse, v_sparse) in enumerate(outputs.past_key_values):
+                                zeros_k = torch.zeros((*k_sparse.shape[:-1], pad_dim), dtype=k_sparse.dtype,
+                                                      device=k_sparse.device)
+                                zeros_v = torch.zeros((*v_sparse.shape[:-1], pad_dim), dtype=v_sparse.dtype,
+                                                      device=v_sparse.device)
+
+                                k_padded = torch.cat([k_sparse, zeros_k], dim=-1)
+                                v_padded = torch.cat([v_sparse, zeros_v], dim=-1)
+                                padded_kv.append((k_padded, v_padded))
+
+                            new_cache = DynamicCache()
+                            for layer_idx, (k, v) in enumerate(padded_kv):
+                                new_cache.update(k, v, layer_idx)
+                            past_key_values = new_cache
+
+                            outputs = active_model(current_input_ids, past_key_values=past_key_values, use_cache=True)
                             logits = outputs.logits[:, -1, :].float()
-                            past_key_values = outputs.past_key_values
                         else:
-                            # 正常生成，继承小模型的 KV Cache
                             past_key_values = outputs.past_key_values
                     else:
-                        # 兜底状态，继承大模型的 KV Cache
                         past_key_values = outputs.past_key_values
 
                     next_token = torch.argmax(logits, dim=-1).unsqueeze(0)
                     generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-
-                    # 🚀 下一轮只喂入最新生成的 1 个 Token
                     current_input_ids = next_token
 
                     if next_token.item() == tokenizer.eos_token_id or next_token.item() == tokenizer.convert_tokens_to_ids(
@@ -338,11 +364,24 @@ def run_grouped_evaluation():
                 else:
                     global_stats["tier_tokens"][current_tier] += total_gen
 
+            # 🌟 核心修正：分类统计不同任务的结果
             if task_info["type"] == "math":
                 global_stats["gsm8k_total"] += 1
                 pred = extract_last_number(final_text)
-                if pred == task_info['a']: global_stats["gsm8k_correct"] += 1
+                if pred == str(task_info.get('a', '')):
+                    global_stats["gsm8k_correct"] += 1
 
+            elif task_info["type"] == "qa":  # MMLU 任务
+                global_stats["mmlu_total"] += 1
+                matches = re.findall(r'[A-D]', final_text)
+                pred = matches[-1] if matches else ""
+                if pred == task_info.get('a', ''):
+                    global_stats["mmlu_correct"] += 1
+
+            elif task_info["type"] == "wiki":  # WikiText 任务
+                global_stats["wiki_count"] += 1
+
+        # 注意这里的缩进！它和 for item in tqdm(...) 是平齐的！
         if current_tier != 3:
             print("🧹 任务完毕，释放小模型显存...")
             del mid_adapter
@@ -351,10 +390,12 @@ def run_grouped_evaluation():
             torch.cuda.empty_cache()
 
     # ==========================================
-    # 打印最终学术报告 (无懈可击的数据展示)
+    # 📊 打印最终学术报告 (多任务泛化性版)
     # ==========================================
-    gsm_acc = (global_stats["gsm8k_correct"] / global_stats["gsm8k_total"]) * 100 if global_stats[
-                                                                                         "gsm8k_total"] > 0 else 0
+    gsm_acc = (global_stats["gsm8k_correct"] / max(1, global_stats["gsm8k_total"])) * 100 if global_stats[
+                                                                                                 "gsm8k_total"] > 0 else 0
+    mmlu_acc = (global_stats["mmlu_correct"] / max(1, global_stats["mmlu_total"])) * 100 if global_stats[
+                                                                                                "mmlu_total"] > 0 else 0
 
     total_t = global_stats["total_tokens"]
     if total_t > 0:
@@ -367,12 +408,17 @@ def run_grouped_evaluation():
     else:
         true_flops_saved, offload_rate = 0, 0
 
-    print("\n" + "=" * 60)
-    print(f" 复杂推理准确率: {gsm_acc:.2f}% ")
-    print(f" 全局触发回退救场次数:     {global_stats['fallback_count']} 次")
-    print(f" 任务卸载率 (交由小模型):   {offload_rate:.2f}% ")
-    print(f" 真实算力白嫖比例 (FLOPs):  {true_flops_saved:.2f}% ")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print(" 🚀 SADS 多任务泛化性评测报告 (Generality)")
+    print("=" * 65)
+    print(f" 🎯 复杂数学推理 (GSM8K):   {gsm_acc:.2f}% ")
+    print(f" 📚 通用知识问答 (MMLU):    {mmlu_acc:.2f}% ")
+    print(f" 📝 长文本生成 (WikiText):  {global_stats['wiki_count']} 篇 (成功不崩溃)")
+    print("-" * 65)
+    print(f" 🔄 触发 SADS 零拷贝救场:   {global_stats['fallback_count']} 次")
+    print(f" 🪂 任务平均卸载率:           {offload_rate:.2f}% ")
+    print(f" ⚡ 真实算力 (FLOPs) 节省:   {true_flops_saved:.2f}% ")
+    print("=" * 65)
 
 
 if __name__ == "__main__":

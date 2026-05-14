@@ -540,3 +540,4 @@ sliced_opt_*/
 
 # (可选) 如果你以后还有其他模型，可以直接写个更通用的：
 # sliced_*/
+experiments/llama3_8b_*/
